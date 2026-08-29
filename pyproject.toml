@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "coding-agent-harness"
+version = "0.1.0"
+description = "A small, extensible harness for coding agents"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.13.5",
+    "typer>=0.27.2",
+]
+
+[project.scripts]
+coding-agent = "coding_agent.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/coding_agent"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
