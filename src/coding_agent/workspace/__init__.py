@@ -1,5 +1,7 @@
-"""Workspace implementations."""
+"""Workspace contracts and implementations."""
 
-from coding_agent.workspace.local import LocalWorkspace, ShellResult
+from coding_agent.workspace.base import Workspace
+from coding_agent.workspace.local import LocalWorkspace
+from coding_agent.workspace.models import CommandResult, FileResult
 
-__all__ = ["LocalWorkspace", "ShellResult"]
+__all__ = ["CommandResult", "FileResult", "LocalWorkspace", "Workspace"]

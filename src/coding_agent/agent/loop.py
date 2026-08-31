@@ -2,11 +2,10 @@
 
 import json
 from dataclasses import dataclass
-from typing import Protocol
 
 from coding_agent.agent.state import AgentState, RunStatus
 from coding_agent.models.base import Message, Model, ModelResponse, ToolDefinition
-from coding_agent.workspace.local import ShellResult
+from coding_agent.workspace.base import Workspace
 
 _DEFAULT_SYSTEM_PROMPT = "You are a coding agent. Use the shell tool when needed, then return a final answer."
 _SHELL_TOOL = ToolDefinition(
@@ -35,10 +34,6 @@ class FinalAnswer:
 
     content: str
 
-class ShellExecutor(Protocol):
-    """Minimal execution boundary needed by the baseline loop."""
-
-    def execute(self, command: str) -> ShellResult: ...
 
 class Agent:
     """Run a model until it returns a final answer."""
@@ -46,7 +41,7 @@ class Agent:
     def __init__(
         self,
         model: Model,
-        workspace: ShellExecutor,
+        workspace: Workspace,
         *,
         system_prompt: str = _DEFAULT_SYSTEM_PROMPT
     ) -> None:
@@ -84,7 +79,7 @@ class Agent:
             self.state.status = RunStatus.COMPLETED
             return
 
-        result = self.workspace.execute(action.command)
+        result = await self.workspace.execute(action.command)
         self.state.messages.append(
             Message(
                 role="tool",

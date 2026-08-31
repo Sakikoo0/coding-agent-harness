@@ -1,19 +1,29 @@
 import json
+from pathlib import Path
 
 import pytest
 
 from coding_agent.agent import Agent, AgentProtocolError, RunStatus
 from coding_agent.models import FakeModel, ModelResponse, ToolCall, Usage
-from coding_agent.workspace import LocalWorkspace, ShellResult
+from coding_agent.workspace import CommandResult, FileResult, LocalWorkspace
 
 
 class FakeWorkspace:
     def __init__(self) -> None:
         self.commands: list[str] = []
 
-    def execute(self, command: str) -> ShellResult:
+    async def execute(self, command: str) -> CommandResult:
         self.commands.append(command)
-        return ShellResult(output="fake output\n", return_code=0)
+        return CommandResult(output="fake output\n", return_code=0)
+
+    async def read_file(self, path: str | Path) -> FileResult:
+        raise NotImplementedError
+
+    async def write_file(self, path: str | Path, content: str) -> FileResult:
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        pass
 
 
 async def test_agent_runs_shell_then_completes(tmp_path) -> None:
