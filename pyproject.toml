@@ -29,6 +29,9 @@ packages = ["src/coding_agent"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "docker: requires a running Docker daemon",
+]
 testpaths = ["tests"]
 
 [tool.ruff]
