@@ -1,3 +1,10 @@
+import asyncio
+import os
+import shlex
+import signal
+import sys
+from pathlib import Path
+
 import pytest
 
 from coding_agent.workspace import LocalWorkspace
@@ -9,17 +16,116 @@ async def test_local_workspace_runs_each_command_in_a_new_process(tmp_path) -> N
     assert (await workspace.execute("cd ..")).return_code == 0
     result = await workspace.execute("pwd")
 
-    assert result.return_code == 0
-    assert result.output.strip() == str(tmp_path.resolve())
+    assert result.exit_code == 0
+    assert result.stdout.strip() == str(tmp_path.resolve())
+    assert result.stderr == ""
+    assert result.timed_out is False
 
 
 async def test_local_workspace_captures_nonzero_exit_and_stderr(tmp_path) -> None:
     result = await LocalWorkspace(tmp_path).execute("printf 'failure\\n' >&2; exit 7")
 
-    assert result.return_code == 7
-    assert result.output == "failure\n"
+    assert result.exit_code == 7
+    assert result.stdout == ""
+    assert result.stderr == "failure\n"
+    assert result.timed_out is False
+
+
+async def test_local_workspace_terminates_timed_out_command(tmp_path) -> None:
+    code = "import sys, time; print('before', flush=True); print('error', file=sys.stderr, flush=True); time.sleep(5)"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+    result = await LocalWorkspace(tmp_path).execute(command, timeout=0.1)
+
+    assert result.exit_code == -1
+    assert result.stdout == "before\n"
+    assert result.stderr == "error\n"
+    assert result.timed_out is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-specific")
+async def test_local_workspace_timeout_kills_child_process(tmp_path) -> None:
+    pid_file = tmp_path / "child.pid"
+    script = tmp_path / "child.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import os",
+                "import sys",
+                "import time",
+                "from pathlib import Path",
+                "Path(sys.argv[1]).write_text(str(os.getpid()))",
+                "while True:",
+                "    time.sleep(1)",
+            ]
+        )
+    )
+    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} {shlex.quote(str(pid_file))}"
+
+    result = await LocalWorkspace(tmp_path).execute(command, timeout=0.5)
+    child_pid = await _read_pid(pid_file)
+
+    try:
+        assert result.timed_out is True
+        assert await _process_exited(child_pid)
+    finally:
+        _kill_process_if_running(child_pid)
+
+
+async def test_local_workspace_uses_requested_cwd(tmp_path) -> None:
+    nested = tmp_path / "nested"
+    nested.mkdir()
+
+    result = await LocalWorkspace(tmp_path).execute("pwd", cwd="nested")
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == str(nested)
+
+
+async def test_local_workspace_merges_and_overrides_environment(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HARNESS_INHERITED", "inherited")
+    monkeypatch.setenv("HARNESS_OVERRIDE", "host")
+    code = (
+        "import os; "
+        "print(os.environ['HARNESS_INHERITED']); "
+        "print(os.environ['HARNESS_OVERRIDE'])"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+    result = await LocalWorkspace(tmp_path).execute(
+        command,
+        env={"HARNESS_OVERRIDE": "workspace"},
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.splitlines() == ["inherited", "workspace"]
 
 
 def test_local_workspace_rejects_missing_root(tmp_path) -> None:
     with pytest.raises(ValueError, match="Workspace root is not a directory"):
         LocalWorkspace(tmp_path / "missing")
+
+
+async def _read_pid(pid_file: Path) -> int:
+    for _ in range(50):
+        if pid_file.is_file() and (content := pid_file.read_text().strip()):
+            return int(content)
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"child never wrote its pid to {pid_file}")
+
+
+async def _process_exited(pid: int) -> bool:
+    for _ in range(40):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+def _kill_process_if_running(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass

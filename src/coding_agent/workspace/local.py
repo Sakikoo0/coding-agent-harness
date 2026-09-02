@@ -1,7 +1,10 @@
 """Workspace implementation backed by the local host."""
 
 import asyncio
+import os
+import signal
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 from coding_agent.workspace.models import CommandResult, FileResult
@@ -16,22 +19,64 @@ class LocalWorkspace:
         if not self.root.is_dir():
             raise ValueError(f"Workspace root is not a directory: {self.root}")
 
-    async def execute(self, command: str) -> CommandResult:
-        return await asyncio.to_thread(self._execute, command)
+    async def execute(
+        self, 
+        command: str,
+        *,
+        cwd: str | Path | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = 30.0
+    ) -> CommandResult:
+        """Execute a command, defaulting to the root and inherited environment.
 
-    def _execute(self, command: str) -> CommandResult:
-        completed = subprocess.run(
+        Relative working directories are resolved from ``root``. Environment
+        values supplied by the caller override inherited host values.
+        """
+        return await asyncio.to_thread(
+            self._execute, 
+            command,
+            cwd=cwd,
+            env=env,
+            timeout=timeout
+        )
+
+    def _execute(
+        self, 
+        command: str,
+        *,
+        cwd: str | Path | None,
+        env: Mapping[str, str] | None,
+        timeout: float | None
+    ) -> CommandResult:
+        working_dir = self.root if cwd is None else self.root / Path(cwd)
+        process = subprocess.Popen(
             command,
             shell=True,
-            cwd=self.root,
+            cwd=working_dir,
+            env=os.environ | dict(env or {}),
             text=True,
             encoding="utf-8",
             errors="replace",
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False
+            stderr=subprocess.PIPE,
+            start_new_session=os.name == "posix",
         )
-        return CommandResult(output=completed.stdout, return_code=completed.returncode)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._kill_process_group(process)
+            stdout, stderr = process.communicate()
+            return CommandResult(
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=-1,
+                timed_out=True,
+            )
+        return CommandResult(
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=process.returncode,
+        )
 
     async def read_file(self, path: str | Path) -> FileResult:
         workspace_path = self._workspace_path(path)
@@ -53,3 +98,13 @@ class LocalWorkspace:
     def _write_text(path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+
+    @staticmethod
+    def _kill_process_group(process: subprocess.Popen[str]) -> None:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass

@@ -7,8 +7,20 @@ from dataclasses import dataclass
 class CommandResult:
     """Captured output from one command execution."""
 
-    output: str
-    return_code: int
+    stdout: str
+    stderr: str
+    exit_code: int
+    timed_out: bool = False
+
+    @property
+    def output(self) -> str:
+        """Return combined output for compatibility with the baseline agent."""
+        return self.stdout + self.stderr
+
+    @property
+    def return_code(self) -> int:
+        """Return the exit code."""
+        return self.exit_code
 
 @dataclass(frozen=True, slots=True)
 class FileResult:

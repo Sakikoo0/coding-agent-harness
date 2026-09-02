@@ -1,4 +1,5 @@
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -12,9 +13,16 @@ class FakeWorkspace:
     def __init__(self) -> None:
         self.commands: list[str] = []
 
-    async def execute(self, command: str) -> CommandResult:
+    async def execute(
+        self,
+        command: str,
+        *,
+        cwd: str | Path | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = 30.0,
+    ) -> CommandResult:
         self.commands.append(command)
-        return CommandResult(output="fake output\n", return_code=0)
+        return CommandResult(stdout="fake output\n", stderr="", exit_code=0)
 
     async def read_file(self, path: str | Path) -> FileResult:
         raise NotImplementedError

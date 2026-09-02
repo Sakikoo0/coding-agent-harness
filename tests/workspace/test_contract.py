@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
 
@@ -13,8 +14,15 @@ class FakeWorkspace:
         self.files: dict[str, str] = {}
         self.closed = False
 
-    async def execute(self, command: str) -> CommandResult:
-        return CommandResult(output=f"executed: {command}", return_code=0)
+    async def execute(
+        self,
+        command: str,
+        *,
+        cwd: str | Path | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = 30.0,
+    ) -> CommandResult:
+        return CommandResult(stdout=f"executed: {command}", stderr="", exit_code=0)
 
     async def read_file(self, path: str | Path) -> FileResult:
         logical_path = str(path)
