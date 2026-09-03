@@ -1,17 +1,22 @@
 import json
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from coding_agent.agent import Agent, AgentProtocolError, RunStatus
-from coding_agent.models import FakeModel, ModelResponse, ToolCall, Usage
-from coding_agent.workspace import CommandResult, FileResult, LocalWorkspace
+from coding_agent.models import FakeModel, ModelResponse, ToolCall, ToolDefinition, ToolResult, Usage
+from coding_agent.tools import ToolContext, ToolRegistry
+from coding_agent.workspace import CommandResult, FileResult
 
 
 class FakeWorkspace:
-    def __init__(self) -> None:
+    def __init__(self, files: dict[str, str] | None = None) -> None:
         self.commands: list[str] = []
+        self.reads: list[str] = []
+        self.writes: list[tuple[str, str]] = []
+        self.files = dict(files or {})
 
     async def execute(
         self,
@@ -25,23 +30,60 @@ class FakeWorkspace:
         return CommandResult(stdout="fake output\n", stderr="", exit_code=0)
 
     async def read_file(self, path: str | Path) -> FileResult:
-        raise NotImplementedError
+        logical_path = str(path)
+        self.reads.append(logical_path)
+        try:
+            content = self.files[logical_path]
+        except KeyError as error:
+            raise FileNotFoundError(logical_path) from error
+        return FileResult(path=logical_path, content=content)
 
     async def write_file(self, path: str | Path, content: str) -> FileResult:
-        raise NotImplementedError
+        logical_path = str(path)
+        self.writes.append((logical_path, content))
+        self.files[logical_path] = content
+        return FileResult(path=logical_path, content=content)
 
     async def close(self) -> None:
         pass
 
 
-async def test_agent_runs_shell_then_completes(tmp_path) -> None:
-    command = "printf 'hello\\n'; printf 'run\\n' >> execution-count.txt"
+class ContextRecordingTool:
+    name = "inspect_context"
+    description = "Record the tool context."
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[dict[str, Any], ToolContext]] = []
+
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(name=self.name, description=self.description, parameters={"type": "object"})
+
+    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+        self.calls.append((arguments, context))
+        return ToolResult(content="context recorded")
+
+
+async def test_agent_dispatches_read_write_shell_then_completes() -> None:
+    workspace = FakeWorkspace({"input.txt": "hello\n"})
     model = FakeModel(
         [
             ModelResponse(
-                content="I will run the command.",
-                tool_calls=[ToolCall(id="call-1", name="shell", arguments={"command": command})],
+                tool_calls=[ToolCall(id="call-1", name="read_file", arguments={"path": "input.txt"})],
                 usage=Usage(input_tokens=10, output_tokens=4, cost=0.01),
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-2",
+                        name="write_file",
+                        arguments={"path": "output.txt", "content": "updated\n"},
+                    )
+                ],
+                usage=Usage(input_tokens=5, output_tokens=3, cost=0.01),
+            ),
+            ModelResponse(
+                tool_calls=[ToolCall(id="call-3", name="shell", arguments={"command": "pytest"})],
+                usage=Usage(input_tokens=6, output_tokens=2, cost=0.01),
             ),
             ModelResponse(
                 content="done",
@@ -49,16 +91,42 @@ async def test_agent_runs_shell_then_completes(tmp_path) -> None:
             ),
         ]
     )
-    agent = Agent(model=model, workspace=LocalWorkspace(tmp_path))
+    agent = Agent(model=model, workspace=workspace)
 
-    state = await agent.run("Print hello once")
+    state = await agent.run("Update the file and run tests")
 
     assert state.status is RunStatus.COMPLETED
-    assert [message.role for message in state.messages] == ["system", "user", "assistant", "tool", "assistant"]
-    assert json.loads(state.messages[3].content or "") == {"output": "hello\n", "return_code": 0}
+    assert [message.role for message in state.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert json.loads(state.messages[3].content or "") == {"content": "hello\n", "is_error": False}
+    assert json.loads(state.messages[5].content or "") == {
+        "content": "Wrote 8 characters to output.txt.",
+        "is_error": False,
+    }
+    shell_result = json.loads(state.messages[7].content or "")
+    assert json.loads(shell_result["content"]) == {
+        "stdout": "fake output\n",
+        "stderr": "",
+        "exit_code": 0,
+        "timed_out": False,
+    }
+    assert shell_result["is_error"] is False
+    assert [state.messages[index].tool_call_id for index in (3, 5, 7)] == ["call-1", "call-2", "call-3"]
     assert state.messages[-1].content == "done"
-    assert state.usage == Usage(input_tokens=22, output_tokens=6, cost=0.03)
-    assert (tmp_path / "execution-count.txt").read_text().splitlines() == ["run"]
+    assert state.usage == Usage(input_tokens=33, output_tokens=11, cost=0.05)
+    assert workspace.reads == ["input.txt"]
+    assert workspace.writes == [("output.txt", "updated\n")]
+    assert workspace.commands == ["pytest"]
+    assert workspace.files["output.txt"] == "updated\n"
 
 
 async def test_agent_rejects_unknown_tool_without_execution() -> None:
@@ -87,8 +155,47 @@ async def test_agent_rejects_shell_call_without_command() -> None:
         workspace=workspace,
     )
 
-    with pytest.raises(AgentProtocolError, match="non-empty string command"):
+    with pytest.raises(AgentProtocolError, match="missing required argument.*command"):
         await agent.run("Run an invalid shell call")
 
     assert agent.state.status is RunStatus.FAILED
     assert workspace.commands == []
+
+
+async def test_agent_propagates_workspace_failure_and_marks_run_failed() -> None:
+    workspace = FakeWorkspace()
+    agent = Agent(
+        model=FakeModel(
+            [ModelResponse(tool_calls=[ToolCall(id="call-1", name="read_file", arguments={"path": "missing.txt"})])]
+        ),
+        workspace=workspace,
+    )
+
+    with pytest.raises(FileNotFoundError, match="missing.txt"):
+        await agent.run("Read a missing file")
+
+    assert agent.state.status is RunStatus.FAILED
+    assert workspace.reads == ["missing.txt"]
+
+
+async def test_agent_supplies_workspace_and_run_id_to_tool_context() -> None:
+    workspace = FakeWorkspace()
+    tool = ContextRecordingTool()
+    agent = Agent(
+        model=FakeModel(
+            [
+                ModelResponse(tool_calls=[ToolCall(id="call-1", name=tool.name, arguments={"value": 7})]),
+                ModelResponse(content="done"),
+            ]
+        ),
+        workspace=workspace,
+        tool_registry=ToolRegistry([tool]),
+    )
+
+    await agent.run("Inspect the runtime context")
+
+    assert len(tool.calls) == 1
+    arguments, context = tool.calls[0]
+    assert arguments == {"value": 7}
+    assert context.workspace is workspace
+    assert context.run_id

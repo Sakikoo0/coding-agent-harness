@@ -1,32 +1,17 @@
 """Minimal linear coding-agent control loop."""
 
-import json
 from dataclasses import dataclass
+from uuid import uuid4
 
 from coding_agent.agent.state import AgentState, RunStatus
-from coding_agent.models.base import Message, Model, ModelResponse, ToolDefinition
+from coding_agent.models.base import Message, Model, ModelResponse, ToolCall
+from coding_agent.tools import ToolArgumentsError, ToolContext, ToolRegistry, UnknownToolError, default_tool_registry
 from coding_agent.workspace.base import Workspace
 
-_DEFAULT_SYSTEM_PROMPT = "You are a coding agent. Use the shell tool when needed, then return a final answer."
-_SHELL_TOOL = ToolDefinition(
-    name="shell",
-    description="Run a shell command in the working directory.",
-    parameters={
-        "type": "object",
-        "properties": {"command": {"type": "string"}},
-        "required": ["command"]
-    }
-)
+_DEFAULT_SYSTEM_PROMPT = "You are a coding agent. Use the available tools when needed, then return a final answer."
 
 class AgentProtocolError(ValueError):
     """Raised when a model response cannot be handled by the baseline loop."""
-
-@dataclass(frozen=True, slots=True)
-class ShellAction:
-    """The only executable action supported by the baseline loop."""
-
-    command: str
-    tool_call_id: str
 
 @dataclass(frozen=True, slots=True)
 class FinalAnswer:
@@ -43,12 +28,15 @@ class Agent:
         model: Model,
         workspace: Workspace,
         *,
+        tool_registry: ToolRegistry | None = None,
         system_prompt: str = _DEFAULT_SYSTEM_PROMPT
     ) -> None:
         self.model = model
         self.workspace = workspace
+        self.tool_registry = tool_registry or default_tool_registry()
         self.system_prompt = system_prompt
         self.state = AgentState()
+        self._tool_context: ToolContext | None = None
 
     async def run(self, task: str) -> AgentState:
         self.state = AgentState(
@@ -59,6 +47,7 @@ class Agent:
             status=RunStatus.RUNNING
         )
 
+        self._tool_context = ToolContext(workspace=self.workspace, run_id=uuid4().hex)
         try:
             while self.state.status is RunStatus.RUNNING:
                 await self.step()
@@ -68,7 +57,7 @@ class Agent:
         return self.state
 
     async def step(self) -> None:
-        response = await self.model.complete(self.state.messages, tools=[_SHELL_TOOL])
+        response = await self.model.complete(self.state.messages, tools=self.tool_registry.definitions())
         self.state.add_usage(response.usage)
         self.state.messages.append(
             Message(role="assistant", content=response.content, tool_calls=response.tool_calls)
@@ -79,22 +68,21 @@ class Agent:
             self.state.status = RunStatus.COMPLETED
             return
 
-        result = await self.workspace.execute(action.command)
+        if self._tool_context is None:
+            raise RuntimeError("Agent step requires an active run")
+        try:
+            result = await self.tool_registry.execute(action, self._tool_context)
+        except (UnknownToolError, ToolArgumentsError) as error:
+            raise AgentProtocolError(str(error)) from error
         self.state.messages.append(
             Message(
                 role="tool",
-                content=json.dumps(
-                    {
-                        "output": result.output,
-                        "return_code": result.return_code
-                    },
-                    ensure_ascii=False
-                ),
-                tool_call_id=action.tool_call_id
+                content=result.model_dump_json(),
+                tool_call_id=action.id,
             )
         )
 
-def _parse_action(response: ModelResponse) -> ShellAction | FinalAnswer:
+def _parse_action(response: ModelResponse) -> ToolCall | FinalAnswer:
     if not response.tool_calls:
         if response.content is None:
             raise AgentProtocolError("Final response must include content")
@@ -103,11 +91,4 @@ def _parse_action(response: ModelResponse) -> ShellAction | FinalAnswer:
     if len(response.tool_calls) != 1:
         raise AgentProtocolError("Baseline agent requires exactly one tool call per response")
 
-    tool_call = response.tool_calls[0]
-    if tool_call.name != _SHELL_TOOL.name:
-        raise AgentProtocolError(f"Unsupported tool: {tool_call.name}")
-
-    command = tool_call.arguments.get("command")
-    if not isinstance(command, str) or not command.strip():
-        raise AgentProtocolError("Shell tool requires a non-empty string command")
-    return ShellAction(command=command, tool_call_id=tool_call.id)
+    return response.tool_calls[0]
