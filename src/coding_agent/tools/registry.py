@@ -6,20 +6,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from coding_agent.models.base import ToolCall, ToolDefinition, ToolResult
-from coding_agent.tools.base import Tool, ToolContext
+from coding_agent.tools.base import (
+    DuplicateToolError,
+    Tool,
+    ToolArgumentsError,
+    ToolContext,
+    ToolRegistryError,
+    UnknownToolError,
+)
+from coding_agent.tools.filesystem import filesystem_tools
 
-
-class ToolRegistryError(ValueError):
-    """Base class for invalid registration or dispatch requests."""
-
-class DuplicateToolError(ToolRegistryError):
-    """Raised when registration would replace an existing tool."""
-
-class UnknownToolError(ToolRegistryError):
-    """Raised when a call names a tool that is not registered."""
-
-class ToolArgumentsError(ToolRegistryError):
-    """Raised when tool arguments do not match the advertised schema."""
 
 class ToolRegistry:
     """Hold tools by name and dispatch typed model calls to them."""
@@ -93,63 +89,9 @@ class ShellTool:
             is_error=result.exit_code != 0 or result.timed_out,
         )
 
-@dataclass(frozen=True, slots=True)
-class ReadFileTool:
-    """Read one UTF-8 text file through the configured workspace."""
-
-    name: str = "read_file"
-    description: str = "Read a UTF-8 text file from the workspace."
-
-    def definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name=self.name,
-            description=self.description,
-            parameters={
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
-                "additionalProperties": False,
-            },
-        )
-
-    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
-        _require_exact_arguments(self.name, arguments, required={"path"})
-        path = _require_non_empty_string(self.name, "path", arguments["path"])
-        result = await context.workspace.read_file(path)
-        return ToolResult(content=result.content)
-
-
-@dataclass(frozen=True, slots=True)
-class WriteFileTool:
-    """Write one UTF-8 text file through the configured workspace."""
-
-    name: str = "write_file"
-    description: str = "Create or overwrite a UTF-8 text file in the workspace."
-
-    def definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name=self.name,
-            description=self.description,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
-                },
-                "required": ["path", "content"],
-                "additionalProperties": False,
-            },
-        )
-
-    async def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
-        _require_exact_arguments(self.name, arguments, required={"path", "content"})
-        path = _require_non_empty_string(self.name, "path", arguments["path"])
-        content = _require_string(self.name, "content", arguments["content"])
-        result = await context.workspace.write_file(path, content)
-        return ToolResult(content=f"Wrote {len(content)} characters to {result.path}.")
-
 def default_tool_registry() -> ToolRegistry:
-    return ToolRegistry([ShellTool(), ReadFileTool(), WriteFileTool()])
+    """Build the current default tool set in stable model-facing order."""
+    return ToolRegistry([ShellTool(), *filesystem_tools()])
 
 def _require_exact_arguments(tool_name: str, arguments: dict[str, Any], *, required: set[str]) -> None:
     supplied = set(arguments)

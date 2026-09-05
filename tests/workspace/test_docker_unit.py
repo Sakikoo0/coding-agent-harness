@@ -132,3 +132,11 @@ def test_docker_workspace_refuses_host_root_mount() -> None:
 def test_docker_workspace_refuses_mount_containing_home_credentials() -> None:
     with pytest.raises(ValueError, match="sensitive directory"):
         DockerWorkspace(Path.home(), image="sandbox:test")
+
+
+@pytest.mark.parametrize("path", ["../etc/passwd", "/etc/passwd"])
+def test_docker_workspace_container_path_rejects_workspace_escape(tmp_path, path) -> None:
+    workspace = DockerWorkspace(tmp_path, image="sandbox:test")
+
+    with pytest.raises(PermissionError, match="outside the workspace"):
+        workspace._container_path(path)

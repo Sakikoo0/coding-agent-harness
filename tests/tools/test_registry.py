@@ -62,10 +62,18 @@ class RecordingTool:
         return ToolResult(content="recorded")
 
 
-def test_default_registry_exposes_only_commit_08_tools_in_stable_order() -> None:
+def test_default_registry_exposes_current_tools_in_stable_order() -> None:
     definitions = default_tool_registry().definitions()
 
-    assert [definition.name for definition in definitions] == ["shell", "read_file", "write_file"]
+    assert [definition.name for definition in definitions] == [
+        "shell",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_directory",
+        "find_files",
+        "search_files",
+    ]
     assert all(definition.parameters["type"] == "object" for definition in definitions)
     assert all(definition.parameters["additionalProperties"] is False for definition in definitions)
 

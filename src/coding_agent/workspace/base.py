@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol
 
-from coding_agent.workspace.models import CommandResult, FileResult
+from coding_agent.workspace.models import CommandResult, FileInfo, FileResult
 
 
 class Workspace(Protocol):
@@ -27,6 +27,14 @@ class Workspace(Protocol):
 
     async def write_file(self, path: str | Path, content: str) -> FileResult:
         """Write a UTF-8 text file in the workspace."""
+        ...
+
+    async def inspect_path(self, path: str | Path) -> FileInfo:
+        """Resolve a relative path and return contained canonical metadata."""
+        ...
+
+    async def list_directory(self, path: str | Path, *, recursive: bool = False) -> list[FileInfo]:
+        """List contained entries below a relative workspace directory."""
         ...
 
     async def close(self) -> None:

@@ -8,7 +8,7 @@ import pytest
 from coding_agent.agent import Agent, AgentProtocolError, RunStatus
 from coding_agent.models import FakeModel, ModelResponse, ToolCall, ToolDefinition, ToolResult, Usage
 from coding_agent.tools import ToolContext, ToolRegistry
-from coding_agent.workspace import CommandResult, FileResult
+from coding_agent.workspace import CommandResult, FileInfo, FileResult
 
 
 class FakeWorkspace:
@@ -43,6 +43,19 @@ class FakeWorkspace:
         self.writes.append((logical_path, content))
         self.files[logical_path] = content
         return FileResult(path=logical_path, content=content)
+
+    async def inspect_path(self, path: str | Path) -> FileInfo:
+        logical_path = str(path)
+        content = self.files.get(logical_path)
+        return FileInfo(
+            path=logical_path,
+            canonical_path=logical_path,
+            exists=content is not None,
+            size=len(content.encode()) if content is not None else 0,
+        )
+
+    async def list_directory(self, path: str | Path, *, recursive: bool = False) -> list[FileInfo]:
+        return []
 
     async def close(self) -> None:
         pass
@@ -107,11 +120,12 @@ async def test_agent_dispatches_read_write_shell_then_completes() -> None:
         "tool",
         "assistant",
     ]
-    assert json.loads(state.messages[3].content or "") == {"content": "hello\n", "is_error": False}
-    assert json.loads(state.messages[5].content or "") == {
-        "content": "Wrote 8 characters to output.txt.",
-        "is_error": False,
-    }
+    read_result = json.loads(state.messages[3].content or "")
+    assert "hello" in read_result["content"]
+    assert read_result["is_error"] is False
+    write_result = json.loads(state.messages[5].content or "")
+    assert write_result["content"] == "Wrote 8 characters (1 lines) to output.txt."
+    assert write_result["is_error"] is False
     shell_result = json.loads(state.messages[7].content or "")
     assert json.loads(shell_result["content"]) == {
         "stdout": "fake output\n",
@@ -162,20 +176,25 @@ async def test_agent_rejects_shell_call_without_command() -> None:
     assert workspace.commands == []
 
 
-async def test_agent_propagates_workspace_failure_and_marks_run_failed() -> None:
+async def test_agent_returns_missing_file_error_to_model_and_continues() -> None:
     workspace = FakeWorkspace()
     agent = Agent(
         model=FakeModel(
-            [ModelResponse(tool_calls=[ToolCall(id="call-1", name="read_file", arguments={"path": "missing.txt"})])]
+            [
+                ModelResponse(tool_calls=[ToolCall(id="call-1", name="read_file", arguments={"path": "missing.txt"})]),
+                ModelResponse(content="The file does not exist."),
+            ]
         ),
         workspace=workspace,
     )
 
-    with pytest.raises(FileNotFoundError, match="missing.txt"):
-        await agent.run("Read a missing file")
+    state = await agent.run("Read a missing file")
 
-    assert agent.state.status is RunStatus.FAILED
-    assert workspace.reads == ["missing.txt"]
+    assert state.status is RunStatus.COMPLETED
+    tool_result = json.loads(state.messages[3].content or "")
+    assert tool_result["is_error"] is True
+    assert "missing.txt" in tool_result["content"]
+    assert workspace.reads == []
 
 
 async def test_agent_supplies_workspace_and_run_id_to_tool_context() -> None:

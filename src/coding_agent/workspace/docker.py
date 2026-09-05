@@ -1,15 +1,18 @@
 """Docker-backed disposable workspace."""
 
 import asyncio
+import posixpath
 import subprocess
 import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 
-from coding_agent.workspace.models import CommandResult, FileResult
+from coding_agent.workspace.local import LocalWorkspace
+from coding_agent.workspace.models import CommandResult, FileInfo, FileResult
 
 _DOCKER = "docker"
 _LIFECYCLE_TIMEOUT = 120.0
+
 
 class DockerWorkspace:
     """Execute commands inside a resource-limited disposable container."""
@@ -23,7 +26,7 @@ class DockerWorkspace:
         cpu_limit: float = 1.0,
         memory_limit: str = "512m",
         network_enabled: bool = False,
-        command_timeout: float = 30.0
+        command_timeout: float = 30.0,
     ) -> None:
         self.root = Path(root).resolve()
         self.image = image
@@ -35,8 +38,8 @@ class DockerWorkspace:
         self._container_id: str | None = None
         self._started = False
         self._closed = False
-
         self._validate_config()
+        self._file_workspace = LocalWorkspace(self.root)
 
     @property
     def container_id(self) -> str | None:
@@ -89,7 +92,12 @@ class DockerWorkspace:
 
     async def read_file(self, path: str | Path) -> FileResult:
         """Read a UTF-8 text file through the container boundary."""
-        container_path = self._container_path(path)
+        info = await self.inspect_path(path)
+        if not info.exists:
+            raise FileNotFoundError(f"Workspace path not found: {str(path)!r}")
+        if info.is_directory:
+            raise IsADirectoryError(f"Workspace path is a directory: {str(path)!r}")
+        container_path = self._container_path(info.canonical_path)
         result = await self._execute_argv(
             ["cat", "--", container_path],
             cwd=self.working_dir,
@@ -100,11 +108,15 @@ class DockerWorkspace:
             raise TimeoutError(f"Timed out reading workspace file: {path}")
         if result.exit_code != 0:
             raise FileNotFoundError(f"Unable to read workspace file {path}: {result.stderr.strip()}")
-        return FileResult(path=str(path), content=result.stdout)
+        is_binary = "\x00" in result.stdout[:8192]
+        return FileResult(path=str(path), content="" if is_binary else result.stdout, is_binary=is_binary)
 
     async def write_file(self, path: str | Path, content: str) -> FileResult:
         """Write a UTF-8 text file through the container boundary."""
-        container_path = self._container_path(path)
+        info = await self.inspect_path(path)
+        if info.exists and info.is_directory:
+            raise IsADirectoryError(f"Workspace path is a directory: {str(path)!r}")
+        container_path = self._container_path(info.canonical_path)
         parent = str(PurePosixPath(container_path).parent)
         result = await self._execute_argv(
             [
@@ -125,6 +137,14 @@ class DockerWorkspace:
         if result.exit_code != 0:
             raise OSError(f"Unable to write workspace file {path}: {result.stderr.strip()}")
         return FileResult(path=str(path), content=content)
+
+    async def inspect_path(self, path: str | Path) -> FileInfo:
+        """Resolve mounted paths through the contained host-side workspace view."""
+        return await self._file_workspace.inspect_path(path)
+
+    async def list_directory(self, path: str | Path, *, recursive: bool = False) -> list[FileInfo]:
+        """List mounted entries without exposing paths outside the bind root."""
+        return await self._file_workspace.list_directory(path, recursive=recursive)
 
     async def stop(self) -> None:
         """Stop the container while retaining it for a later start."""
@@ -173,19 +193,19 @@ class DockerWorkspace:
         name = f"coding-agent-{uuid.uuid4().hex[:12]}"
         mount = f"type=bind,source={self.root},target={self.working_dir}"
         command = [
-           _DOCKER,
-           "create",
-           "--name",
-           name,
-           "--init",
-           "--workdir",
-           self.working_dir,
-           "--cpus",
-           str(self.cpu_limit),
-           "--memory",
-           self.memory_limit,
-           "--mount",
-           mount
+            _DOCKER,
+            "create",
+            "--name",
+            name,
+            "--init",
+            "--workdir",
+            self.working_dir,
+            "--cpus",
+            str(self.cpu_limit),
+            "--memory",
+            self.memory_limit,
+            "--mount",
+            mount,
         ]
         if not self.network_enabled:
             command.extend(["--network", "none"])
@@ -256,7 +276,7 @@ class DockerWorkspace:
         args: Sequence[str],
         *,
         timeout: float | None,
-        input_text: str | None = None
+        input_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return await asyncio.to_thread(
             subprocess.run,
@@ -272,10 +292,13 @@ class DockerWorkspace:
         )
 
     def _container_path(self, path: str | Path) -> str:
-        """Convert a path to an absolute container path."""
         candidate = PurePosixPath(str(path))
         if not candidate.is_absolute():
             candidate = PurePosixPath(self.working_dir) / candidate
+        candidate = PurePosixPath(posixpath.normpath(str(candidate)))
+        root = PurePosixPath(self.working_dir)
+        if not candidate.is_relative_to(root):
+            raise PermissionError(f"Workspace path {str(path)!r} resolves outside the workspace")
         return str(candidate)
 
     def _validate_config(self) -> None:

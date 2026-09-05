@@ -101,6 +101,35 @@ async def test_local_workspace_merges_and_overrides_environment(tmp_path, monkey
     assert result.stdout.splitlines() == ["inherited", "workspace"]
 
 
+@pytest.mark.parametrize("path", ["../outside.txt", "../../outside.txt"])
+async def test_local_workspace_file_operations_reject_parent_traversal(tmp_path, path) -> None:
+    workspace = LocalWorkspace(tmp_path)
+
+    with pytest.raises(PermissionError, match="outside the workspace"):
+        await workspace.read_file(path)
+    with pytest.raises(PermissionError, match="outside the workspace"):
+        await workspace.write_file(path, "changed")
+
+
+async def test_local_workspace_file_operations_reject_absolute_paths(tmp_path) -> None:
+    workspace = LocalWorkspace(tmp_path)
+
+    with pytest.raises(PermissionError, match="absolute paths are not allowed"):
+        await workspace.inspect_path(tmp_path / "file.txt")
+
+
+async def test_local_workspace_rejects_symlink_escape_and_omits_it_from_listing(tmp_path) -> None:
+    outside = tmp_path.parent / "outside-workspace.txt"
+    outside.write_text("secret", encoding="utf-8")
+    (tmp_path / "escape.txt").symlink_to(outside)
+    workspace = LocalWorkspace(tmp_path)
+
+    with pytest.raises(PermissionError, match="outside the workspace"):
+        await workspace.read_file("escape.txt")
+
+    assert await workspace.list_directory(".") == []
+
+
 def test_local_workspace_rejects_missing_root(tmp_path) -> None:
     with pytest.raises(ValueError, match="Workspace root is not a directory"):
         LocalWorkspace(tmp_path / "missing")

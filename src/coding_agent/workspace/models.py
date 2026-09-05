@@ -28,3 +28,14 @@ class FileResult:
 
     path: str
     content: str
+    is_binary: bool = False
+
+@dataclass(frozen=True, slots=True)
+class FileInfo:
+    """Canonical metadata for one path contained by a workspace."""
+
+    path: str
+    canonical_path: str
+    exists: bool
+    is_directory: bool = False
+    size: int = 0
